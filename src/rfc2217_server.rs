@@ -62,9 +62,11 @@ impl Rfc2217Server {
         let mut tcp_data = [0; 256];
         match self.tcp_conn.read(&mut tcp_data) {
             Ok(bytes_read) => {
-                let bytes = &tcp_data[..bytes_read];
-                log::debug!("tcp read {bytes_read} bytes ({bytes:02x?}");
-                self.process_tcp_data(bytes)?;
+                if bytes_read > 0 {
+                    let bytes = &tcp_data[..bytes_read];
+                    log::debug!("tcp read {bytes_read} bytes ({bytes:02x?}");
+                    self.process_tcp_data(bytes)?;
+                }
             }
             Err(err) => match err.kind() {
                 io::ErrorKind::WouldBlock => {}
@@ -80,19 +82,21 @@ impl Rfc2217Server {
         let mut port_data = [0; 256];
         match self.port_reader.read(&mut port_data) {
             Ok(bytes_read) => {
-                let bytes = &port_data[..bytes_read];
-                log::debug!("port read {bytes_read} bytes ({bytes:02x?}");
+                if bytes_read > 0 {
+                    let bytes = &port_data[..bytes_read];
+                    log::trace!("serial port read {bytes_read} bytes ({bytes:02x?}");
 
-                // send from serial port to tcp
-                log::debug!("writing port data to tcp");
-                for &byte in &port_data[..bytes_read] {
-                    // Escape all IAC bytes
-                    self.tcp_writer.write_all(&[byte]).map_err(Error::Tcp)?;
-                    if byte == codes::IAC {
+                    // send from serial port to tcp
+                    log::debug!("writing serial port data to tcp");
+                    for &byte in &port_data[..bytes_read] {
+                        // Escape all IAC bytes
                         self.tcp_writer.write_all(&[byte]).map_err(Error::Tcp)?;
+                        if byte == codes::IAC {
+                            self.tcp_writer.write_all(&[byte]).map_err(Error::Tcp)?;
+                        }
                     }
+                    log::debug!("wrote port data to tcp");
                 }
-                log::debug!("wrote port data to tcp");
             }
             Err(err) => match err.kind() {
                 io::ErrorKind::TimedOut => {}
