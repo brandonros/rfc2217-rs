@@ -1,7 +1,10 @@
+use crate::usb_serial_wrapper::UsbSerialWrapper;
 use crate::serialport_conversions::*;
 use crate::{
     codes, negotiation, parser, subnegotiation, Command, Negotiation, Parser, Subnegotiation,
 };
+use std::sync::Arc;
+use rusb::{DeviceHandle, GlobalContext};
 use serialport::{ClearBuffer, FlowControl, SerialPort};
 use std::io::{self, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
@@ -14,9 +17,9 @@ pub enum Error {
     Tcp(io::Error),
 }
 
-pub struct Server {
-    port: Box<dyn SerialPort>,
-    port_writer: BufWriter<Box<dyn SerialPort>>,
+pub struct Rfc2217Server {
+    port_reader: Box<UsbSerialWrapper>,
+    port_writer: BufWriter<Box<UsbSerialWrapper>>,
     tcp_conn: TcpStream,
     tcp_writer: BufWriter<TcpStream>,
     tcp_answer_buf: [u8; subnegotiation::MAX_SIZE],
@@ -26,21 +29,24 @@ pub struct Server {
     break_state: bool,
 }
 
-impl Server {
-    pub fn new<A: ToSocketAddrs>(serial_port_name: &str, tcp_addr: A) -> Result<Self, Error> {
-        let port = serialport::new(serial_port_name, 9600)
-            .open()
-            .map_err(Error::SerialInit)?;
-        let port_clone = port.try_clone().map_err(Error::SerialInit)?;
+impl Rfc2217Server {
+    pub fn new_from_usb<A: ToSocketAddrs>(device_handle: Arc<DeviceHandle<GlobalContext>>, in_endpoint_address: u8, out_endpoint_address: u8, tcp_addr: A) -> Result<Self, Error> {
+        // usb
+        let read_device_handle = device_handle.clone();
+        let write_device_handle = device_handle.clone();
+        
+        // tcp
         let listener = TcpListener::bind(tcp_addr).map_err(Error::Tcp)?;
+        log::info!("bounding; waiting for connection...");
         let (connection, _) = listener.accept().map_err(Error::Tcp)?;
+        log::info!("accepted connection");
         connection.set_nonblocking(true).map_err(Error::Tcp)?;
         let cloned_connection = connection.try_clone().map_err(Error::Tcp)?;
 
-        Ok(Server {
-            port: port,
+        Ok(Rfc2217Server {
             parser: Parser::new(),
-            port_writer: BufWriter::new(port_clone),
+            port_reader: Box::new(UsbSerialWrapper::new_from_usb(read_device_handle, in_endpoint_address, out_endpoint_address)),
+            port_writer: BufWriter::new(Box::new(UsbSerialWrapper::new_from_usb(write_device_handle, in_endpoint_address, out_endpoint_address))),
             tcp_conn: connection,
             tcp_writer: BufWriter::new(cloned_connection),
             tcp_answer_buf: [0; subnegotiation::MAX_SIZE],
@@ -52,21 +58,33 @@ impl Server {
 
     pub fn run(&mut self) -> Result<(), Error> {
         // Read and handle the data from the TCP connection
+        log::trace!("reading from tcp...");
         let mut tcp_data = [0; 256];
         match self.tcp_conn.read(&mut tcp_data) {
             Ok(bytes_read) => {
-                self.process_tcp_data(&tcp_data[..bytes_read])?;
+                let bytes = &tcp_data[..bytes_read];
+                log::debug!("tcp read {bytes_read} bytes ({bytes:02x?}");
+                self.process_tcp_data(bytes)?;
             }
-            Err(error) => match error.kind() {
+            Err(err) => match err.kind() {
                 io::ErrorKind::WouldBlock => {}
-                _ => return Err(Error::Tcp(error)),
+                _ => {
+                    log::error!("tcp read error err = {err}");
+                    return Err(Error::Tcp(err))
+                },
             },
         }
 
         // Read and handle the data from the serial port
+        log::trace!("reading from serial port..");
         let mut port_data = [0; 256];
-        match self.port.read(&mut port_data) {
+        match self.port_reader.read(&mut port_data) {
             Ok(bytes_read) => {
+                let bytes = &port_data[..bytes_read];
+                log::debug!("port read {bytes_read} bytes ({bytes:02x?}");
+
+                // send from serial port to tcp
+                log::debug!("writing port data to tcp");
                 for &byte in &port_data[..bytes_read] {
                     // Escape all IAC bytes
                     self.tcp_writer.write_all(&[byte]).map_err(Error::Tcp)?;
@@ -74,10 +92,14 @@ impl Server {
                         self.tcp_writer.write_all(&[byte]).map_err(Error::Tcp)?;
                     }
                 }
+                log::debug!("wrote port data to tcp");
             }
-            Err(error) => match error.kind() {
+            Err(err) => match err.kind() {
                 io::ErrorKind::TimedOut => {}
-                _ => return Err(Error::Serial(error)),
+                _ => {
+                    log::error!("port read error err = {err}");
+                    return Err(Error::Serial(err))
+                },
             },
         }
 
@@ -91,9 +113,12 @@ impl Server {
     fn process_tcp_data(&mut self, bytes: &[u8]) -> Result<(), Error> {
         for &byte in bytes {
             if let Some(event) = self.parser.process_byte(byte).map_err(Error::Parsing)? {
+                log::debug!("process_tcp_data: byte = {byte:02x} event = {event:?}");
                 let answer_size = self.process_event(event).map_err(Error::Serial)?;
+                let answer = &self.tcp_answer_buf[..answer_size];
+                log::debug!("process_tcp_data: byte = {byte:02x} event = {event:?} answer = {answer:02x?}");
                 self.tcp_writer
-                    .write_all(&self.tcp_answer_buf[..answer_size])
+                    .write_all(answer)
                     .map_err(Error::Tcp)?;
             }
         }
@@ -103,24 +128,34 @@ impl Server {
     fn process_event(&mut self, event: parser::Event) -> Result<usize, io::Error> {
         match event {
             parser::Event::Data(byte) => {
+                log::info!("parser::Event::Data byte = {byte:02x}");
                 self.port_writer.write_all(&[byte])?;
                 Ok(0)
             }
-            parser::Event::Command(command) => self.process_command(command),
-            parser::Event::Negotiation(negotiation) => self.process_negotiation(negotiation),
+            parser::Event::Command(command) => {
+                log::info!("parser::Event::Command command = {command:02x?}");
+                self.process_command(command)
+            },
+            parser::Event::Negotiation(negotiation) => {
+                log::info!("parser::Event::Negotiation negotiation = {negotiation:02x?}");
+                self.process_negotiation(negotiation)
+            },
             parser::Event::Subnegotiation(subnegotiation) => {
+                log::info!("parser::Event::Subnegotiation subnegotiation = {subnegotiation:02x?}");
                 self.process_subnegotiation(subnegotiation)
             }
         }
     }
 
     fn process_command(&mut self, command: Command) -> Result<usize, io::Error> {
+        log::info!("process_command: command = {command:?}");
         match command {
             _ => Ok(0),
         }
     }
 
     fn process_negotiation(&mut self, negotiation: Negotiation) -> Result<usize, io::Error> {
+        log::info!("process_negotiation: negotiation = {negotiation:?}");
         match negotiation.get_answer() {
             Some(answer) => {
                 answer.serialize(&mut self.tcp_answer_buf[..negotiation::SIZE]);
@@ -134,8 +169,10 @@ impl Server {
         &mut self,
         subnegotiation: Subnegotiation,
     ) -> Result<usize, io::Error> {
+        log::info!("process_subnegotiation: subnegotiation = {subnegotiation:?}");
         let answer_opt = match subnegotiation {
             Subnegotiation::SetSignature { data, size } => {
+                log::info!("SetSignature");
                 // An empty signature constitutes a signature query
                 if size == 0 {
                     let mut data = [0; subnegotiation::MAX_DATA_SIZE];
@@ -149,56 +186,74 @@ impl Server {
             }
 
             Subnegotiation::SetBaudRate(val) => {
+                log::info!("SetBaudRate");
                 if val == 0 {
-                    Some(Subnegotiation::SetBaudRate(self.port.baud_rate()?))
+                    Some(Subnegotiation::SetBaudRate(self.port_reader.baud_rate()?))
                 } else {
-                    self.port.set_baud_rate(val)?;
+                    self.port_reader.set_baud_rate(val)?;
                     Some(subnegotiation)
                 }
             }
 
-            Subnegotiation::SetDataSize(val) => match u8_to_data_bits(val) {
-                Some(data_bits) => {
-                    self.port.set_data_bits(data_bits)?;
-                    Some(subnegotiation)
+            Subnegotiation::SetDataSize(val) => {
+                log::info!("SetDataSize");
+                match u8_to_data_bits(val) {
+                    Some(data_bits) => {
+                        self.port_reader.set_data_bits(data_bits)?;
+                        Some(subnegotiation)
+                    }
+                    None => Some(Subnegotiation::SetDataSize(data_bits_to_u8(
+                        self.port_reader.data_bits()?,
+                    ))),
                 }
-                None => Some(Subnegotiation::SetDataSize(data_bits_to_u8(
-                    self.port.data_bits()?,
-                ))),
             },
 
-            Subnegotiation::SetParity(val) => match u8_to_parity(val) {
-                Some(parity) => {
-                    self.port.set_parity(parity)?;
-                    Some(subnegotiation)
+            Subnegotiation::SetParity(val) => {
+                log::info!("SetParity");
+                match u8_to_parity(val) {
+                    Some(parity) => {
+                        self.port_reader.set_parity(parity)?;
+                        Some(subnegotiation)
+                    }
+                    None => Some(Subnegotiation::SetParity(parity_to_u8(self.port_reader.parity()?))),
                 }
-                None => Some(Subnegotiation::SetParity(parity_to_u8(self.port.parity()?))),
             },
 
-            Subnegotiation::SetStopSize(val) => match u8_to_stop_bits(val) {
-                Some(stop_bits) => {
-                    self.port.set_stop_bits(stop_bits)?;
-                    Some(subnegotiation)
+            Subnegotiation::SetStopSize(val) => {
+                log::info!("SetStopSize");
+                match u8_to_stop_bits(val) {
+                    Some(stop_bits) => {
+                        self.port_reader.set_stop_bits(stop_bits)?;
+                        Some(subnegotiation)
+                    }
+                    None => Some(Subnegotiation::SetStopSize(stop_bits_to_u8(
+                        self.port_reader.stop_bits()?,
+                    ))),
                 }
-                None => Some(Subnegotiation::SetStopSize(stop_bits_to_u8(
-                    self.port.stop_bits()?,
-                ))),
             },
 
-            Subnegotiation::SetControl(val) => self.handle_set_control(val)?,
+            Subnegotiation::SetControl(val) => {
+                log::info!("SetControl");
+                self.handle_set_control(val)?
+            },
 
             Subnegotiation::FlowControlSuspend => {
-                self.suspended_flow_control = self.port.flow_control()?;
-                self.port.set_flow_control(FlowControl::None)?;
+                log::info!("FlowControlSuspend");
+                self.suspended_flow_control = self.port_reader.flow_control()?;
+                self.port_reader.set_flow_control(FlowControl::None)?;
                 Some(subnegotiation)
             }
 
             Subnegotiation::FlowControlResume => {
-                self.port.set_flow_control(self.suspended_flow_control)?;
+                log::info!("FlowControlResume");
+                self.port_reader.set_flow_control(self.suspended_flow_control)?;
                 Some(subnegotiation)
             }
 
-            Subnegotiation::PurgeData(val) => self.handle_purge_data(val)?,
+            Subnegotiation::PurgeData(val) => {
+                log::info!("PurgeData");
+                self.handle_purge_data(val)?
+            },
 
             _ => None,
         };
@@ -210,12 +265,13 @@ impl Server {
     }
 
     fn handle_set_control(&mut self, val: u8) -> Result<Option<Subnegotiation>, io::Error> {
+        log::info!("handle_set_control val = {val:02x}");
         match val {
             0 => Ok(Some(Subnegotiation::SetControl(flow_control_to_u8(
-                self.port.flow_control()?,
+                self.port_reader.flow_control()?,
             )))),
             1 | 2 | 3 => {
-                self.port
+                self.port_reader
                     .set_flow_control(u8_to_flow_control(val).unwrap())?;
                 Ok(Some(Subnegotiation::SetControl(val)))
             }
@@ -224,37 +280,37 @@ impl Server {
                 false => Ok(Some(Subnegotiation::SetControl(6))),
             },
             5 => {
-                self.port.set_break()?;
+                self.port_reader.set_break()?;
                 self.break_state = true;
                 Ok(Some(Subnegotiation::SetControl(val)))
             }
             6 => {
-                self.port.clear_break()?;
+                self.port_reader.clear_break()?;
                 self.break_state = false;
                 Ok(Some(Subnegotiation::SetControl(val)))
             }
-            7 => match self.port.read_data_set_ready()? {
+            7 => match self.port_reader.read_data_set_ready()? {
                 true => Ok(Some(Subnegotiation::SetControl(8))),
                 false => Ok(Some(Subnegotiation::SetControl(9))),
             },
             8 => {
-                self.port.write_data_terminal_ready(true)?;
+                self.port_reader.write_data_terminal_ready(true)?;
                 Ok(Some(Subnegotiation::SetControl(val)))
             }
             9 => {
-                self.port.write_data_terminal_ready(false)?;
+                self.port_reader.write_data_terminal_ready(false)?;
                 Ok(Some(Subnegotiation::SetControl(val)))
             }
-            10 => match self.port.read_clear_to_send()? {
+            10 => match self.port_reader.read_clear_to_send()? {
                 true => Ok(Some(Subnegotiation::SetControl(11))),
                 false => Ok(Some(Subnegotiation::SetControl(12))),
             },
             11 => {
-                self.port.write_request_to_send(true)?;
+                self.port_reader.write_request_to_send(true)?;
                 Ok(Some(Subnegotiation::SetControl(val)))
             }
             12 => {
-                self.port.write_request_to_send(false)?;
+                self.port_reader.write_request_to_send(false)?;
                 Ok(Some(Subnegotiation::SetControl(val)))
             }
             _ => Ok(None),
@@ -262,18 +318,19 @@ impl Server {
     }
 
     fn handle_purge_data(&mut self, val: u8) -> Result<Option<Subnegotiation>, io::Error> {
+        log::info!("handle_purge_data val = {val:02x}");
         match val {
             1 => {
-                self.port.clear(ClearBuffer::Input)?;
+                self.port_reader.clear(ClearBuffer::Input)?;
                 Ok(Some(Subnegotiation::PurgeData(val)))
             }
             2 => {
-                self.port.clear(ClearBuffer::Output)?;
+                self.port_reader.clear(ClearBuffer::Output)?;
                 Ok(Some(Subnegotiation::PurgeData(val)))
             }
             3 => {
-                self.port.clear(ClearBuffer::Input)?;
-                self.port.clear(ClearBuffer::Output)?;
+                self.port_reader.clear(ClearBuffer::Input)?;
+                self.port_reader.clear(ClearBuffer::Output)?;
                 Ok(Some(Subnegotiation::PurgeData(val)))
             }
             _ => Ok(None),

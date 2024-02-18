@@ -17,9 +17,6 @@ keywords = [
 ]
 
 [dependencies]
-serialport = { version = "4.2.0", optional = true, default-features = false }
-clap = { version = "4.5", optional = true, features = ["derive"] }
-
-[features]
-default = ["std"]
-std = ["serialport", "clap"]
+log = "0.4.20"
+serialport = "4.2.0"
+rusb = "0.9"

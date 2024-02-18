@@ -14,6 +14,7 @@ pub enum Error {
     BufferOverflow,
 }
 
+#[derive(Debug)]
 enum State {
     Data,
     Command,
@@ -44,6 +45,7 @@ impl Parser {
     }
 
     pub fn process_byte(&mut self, byte: u8) -> Result<Option<Event>, Error> {
+        log::debug!("process_byte: state = {:?}", self.state);
         match self.state {
             State::Data => {
                 if byte == codes::IAC {
