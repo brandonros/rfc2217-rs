@@ -134,6 +134,7 @@ impl Rfc2217Server {
             parser::Event::Data(byte) => {
                 log::info!("parser::Event::Data byte = {byte:02x}");
                 self.port_writer.write_all(&[byte])?;
+                self.port_writer.flush()?; // TODO: do not flush everytime?
                 Ok(0)
             }
             parser::Event::Command(command) => {
