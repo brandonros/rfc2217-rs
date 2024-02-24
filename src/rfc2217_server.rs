@@ -119,10 +119,10 @@ impl Rfc2217Server {
     fn process_tcp_data(&mut self, bytes: &[u8]) -> Result<(), Error> {
         for &byte in bytes {
             if let Some(event) = self.parser.process_byte(byte).map_err(Error::Parsing)? {
-                log::debug!("process_tcp_data: byte = {byte:02x} event = {event:?}");
+                log::debug!("process_tcp_data: byte = {byte:02x} event = {event:02x?}");
                 let answer_size = self.process_event(event).map_err(Error::Serial)?;
                 let answer = &self.tcp_answer_buf[..answer_size];
-                log::debug!("process_tcp_data: byte = {byte:02x} event = {event:?} answer = {answer:02x?}");
+                log::debug!("process_tcp_data: byte = {byte:02x} event = {event:02x?} answer = {answer:02x?}");
                 self.tcp_writer
                     .write_all(answer)
                     .map_err(Error::Tcp)?;
