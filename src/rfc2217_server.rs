@@ -86,7 +86,7 @@ impl Rfc2217Server {
 
                 if bytes_read > 0 {
                     let bytes = &port_data[..bytes_read];
-                    log::trace!("serial port read {bytes_read} bytes ({bytes:02x?}");
+                    log::debug!("serial port read {bytes_read} bytes ({bytes:02x?}");
 
                     // send from serial port to tcp
                     log::debug!("writing serial port data to tcp");
