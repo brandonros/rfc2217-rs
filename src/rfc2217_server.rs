@@ -82,6 +82,8 @@ impl Rfc2217Server {
         let mut port_data = [0; 256];
         match self.port_reader.read(&mut port_data) {
             Ok(bytes_read) => {
+                log::trace!("serial port read {bytes_read}");
+
                 if bytes_read > 0 {
                     let bytes = &port_data[..bytes_read];
                     log::trace!("serial port read {bytes_read} bytes ({bytes:02x?}");
@@ -134,7 +136,6 @@ impl Rfc2217Server {
             parser::Event::Data(byte) => {
                 log::info!("parser::Event::Data byte = {byte:02x}");
                 self.port_writer.write_all(&[byte])?;
-                self.port_writer.flush()?; // TODO: do not flush everytime?
                 Ok(0)
             }
             parser::Event::Command(command) => {
