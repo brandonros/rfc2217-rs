@@ -24,9 +24,7 @@ impl std::io::Read for UsbSerialWrapper {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let timeout = Duration::from_millis(5);
         match self.device_handle.read_bulk(self.in_endpoint_address, buf, timeout) {
-            Ok(bytes_read) => {
-                Ok(bytes_read)
-            },
+            Ok(bytes_read) => Ok(bytes_read),
             Err(err) => {
                 match err {
                     rusb::Error::Timeout => Ok(0), // 0 bytes read for non-blocking I/O
