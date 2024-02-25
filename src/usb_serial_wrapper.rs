@@ -29,15 +29,13 @@ impl std::io::Read for UsbSerialWrapper {
             },
             Err(err) => {
                 match err {
-                    rusb::Error::Io => todo!(),
+                    rusb::Error::Timeout => Ok(0), // 0 bytes read for non-blocking I/O
+                    rusb::Error::Io => Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Unexpected EOF")), // returned when device is disconnected
                     rusb::Error::InvalidParam => todo!(),
                     rusb::Error::Access => todo!(),
                     rusb::Error::NoDevice => todo!(),
                     rusb::Error::NotFound => todo!(),
                     rusb::Error::Busy => todo!(),
-                    rusb::Error::Timeout => {
-                        Ok(0)
-                    }
                     rusb::Error::Overflow => todo!(),
                     rusb::Error::Pipe => todo!(),
                     rusb::Error::Interrupted => todo!(),
